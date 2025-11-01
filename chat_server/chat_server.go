@@ -127,16 +127,14 @@ func (c *ChatServer) Serve() {
 				}
 
 			case evts&unix.EPOLLERR != 0:
-				fmt.Println("epoll error:", err)
-
-			case evts&unix.EPOLLHUP != 0: // this means that we have closed connection
-				// close all the connections
-				for fd := range c.ActiveUserMap {
-					c.CloseClient(fd)
+				errNo, err := unix.GetsockoptInt(int(evtFd), unix.SOL_SOCKET, unix.SO_ERROR)
+				if err != nil {
+					fmt.Println("error getting socket error number:", err)
+				} else {
+					fmt.Println("error from epoll:", unix.Errno(errNo))
 				}
-				c.Close()
-				return
-
+				c.CloseClient(int(evtFd))
+			case evts&unix.EPOLLHUP != 0:
 			case evts&unix.EPOLLRDHUP != 0: // this means that client has closed the connection.
 				c.CloseClient(int(evtFd))
 
