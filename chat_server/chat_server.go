@@ -29,7 +29,7 @@ type ChatServer struct {
 
 	bp *BufferPool
 
-	mu sync.Mutex
+	mu sync.RWMutex
 }
 
 func NewChatServer(a, b, c, d byte, port int) *ChatServer {
@@ -58,6 +58,10 @@ func (c *ChatServer) bindAndListen() error {
 		return err
 	}
 
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
+		return err
+	}
+
 	if err := unix.SetNonblock(fd, true); err != nil {
 		return err
 	}
@@ -68,7 +72,7 @@ func (c *ChatServer) bindAndListen() error {
 		return err
 	}
 
-	return unix.Listen(fd, 2048) // max pending connections can be 2048
+	return unix.Listen(fd, 4096) // max pending connections can be 2048
 }
 
 func (c *ChatServer) setupEpollAndEvents() error {
@@ -108,7 +112,7 @@ func (c *ChatServer) accept() error {
 func (c *ChatServer) Serve() {
 	// serve waits for events for happens and adjusts
 	for {
-		events := make([]unix.EpollEvent, 1000)
+		events := make([]unix.EpollEvent, 100000)
 		n, err := unix.EpollWait(c.epollFd, events, -1) // wait forever
 		// ifErrExit(err, "error waiting for events to happen")
 		if err != nil {
@@ -137,6 +141,7 @@ func (c *ChatServer) Serve() {
 			case evts&unix.EPOLLHUP != 0:
 			case evts&unix.EPOLLRDHUP != 0: // this means that client has closed the connection.
 				c.CloseClient(int(evtFd))
+				continue
 
 			case evts&unix.EPOLLIN != 0:
 				buf := c.bp.GetBuffer()
@@ -147,26 +152,42 @@ func (c *ChatServer) Serve() {
 				}
 				c.broadcast(int(evtFd), buf[:n])
 				c.bp.PutBuffer(buf)
-				// default:
-				// fmt.Println("no matching casee")
 			}
 		}
 	}
 }
 
 func (c *ChatServer) broadcast(from int, b []byte) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for k := range c.ActiveUserMap {
-		if k == from {
+	// TODO: snapshot all available fds execpt the one it is from
+	fds := make([]int, 0, len(c.ActiveUserMap))
+	who := ""
+	c.mu.RLock()
+	if _, ok := c.ActiveUserMap[from]; !ok {
+		return
+	}
+	for fd := range c.ActiveUserMap {
+		if from == fd {
+			who = c.ActiveUserMap[fd]
 			continue
 		}
-		msg := fmt.Sprintf("%s: %s", c.ActiveUserMap[from], string(b))
-		_, err := unix.Write(k, []byte(msg))
+		fds = append(fds, fd)
+	}
+	c.mu.RUnlock()
+
+	msg := []byte(fmt.Sprintf("%s says, %s", who, string(b)))
+	for i := range fds {
+		_, err := unix.Write(fds[i], msg)
 		if err != nil {
-			fmt.Println("error writing message to client:", err)
-			continue
+			switch err {
+			case unix.EAGAIN:
+				continue
+			case unix.EPIPE:
+			case unix.ECONNRESET:
+				c.CloseClient(fds[i])
+			default:
+				fmt.Println("error while broadcasting", err)
+			}
+
 		}
 	}
 }
