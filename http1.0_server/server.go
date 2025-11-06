@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/toastsandwich/epoll-learn/http1.0_server/pkg/pool"
@@ -30,20 +31,18 @@ type HTTPServer struct {
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
 
-	// bonus
-	// RateLimit int
-	buffers *pool.BufferPool
-	jm      *JobManager
+	ActiveConnMap map[int]*Conn
+
+	mu sync.RWMutex
 }
 
 func NewHTTPServer(opts *HTTPServerOpts) (*HTTPServer, error) {
 	server := &HTTPServer{}
 
-	server.buffers = pool.NewBufferPool(true)
-	server.jm = NewJobManager(8)
-
 	fmt.Sscanf(opts.Addr, "%d.%d.%d.%d", server.sockAddr.Addr[0], server.sockAddr.Addr[1], server.sockAddr.Addr[2], server.sockAddr.Addr[3])
 	server.sockAddr.Port = opts.Port
+
+	server.ActiveConnMap = make(map[int]*Conn)
 
 	server.ReadTimeout = opts.ReadTimeout
 	server.WriteTimeout = opts.WriteTimeout
@@ -119,11 +118,18 @@ func (s *HTTPServer) accept() {
 			continue
 		}
 
+		// create conn and add it to conn map
+		conn := NewConn(cfd)
+		s.mu.Lock()
+		s.ActiveConnMap[cfd] = conn
+		s.mu.Unlock()
+
 		// hand off cfd as intrested in epoll instance
 		clientEvent := &unix.EpollEvent{
 			Fd:     int32(cfd),
 			Events: EVENT_IN_ET_ERR,
 		}
+
 		if err := unix.EpollCtl(s.epollFd, unix.EPOLL_CTL_ADD, cfd, clientEvent); err != nil {
 			fmt.Println("error setting controls for new client connection:", err)
 		}
@@ -131,7 +137,7 @@ func (s *HTTPServer) accept() {
 }
 
 func (s *HTTPServer) ListenAndServe() error {
-	defer s.jm.Close()
+
 	if err := unix.Listen(s.Fd, 2048); err != nil {
 		return err
 	}
@@ -149,20 +155,30 @@ func (s *HTTPServer) ListenAndServe() error {
 		}
 		for i := range n {
 			e := epollEvents[i]
-			if e.Fd == int32(s.Fd) {
-				s.accept()
-			}
+
 			switch {
+			case e.Fd == int32(s.Fd):
+				s.accept()
+
 			case e.Events&(unix.EPOLLERR|unix.EPOLLHUP|unix.EPOLLRDHUP) != 0:
+				s.mu.RLock()
+				if conn, ok := s.ActiveConnMap[int(e.Fd)]; ok {
+					conn.Close()
+					delete(s.ActiveConnMap, int(e.Fd))
+				}
+				s.mu.RUnlock()
+
 				errno, err := unix.GetsockoptInt(int(e.Fd), unix.SOL_SOCKET, unix.SO_ERROR)
 				if err != nil {
 					return err
 				}
 				err = unix.Errno(errno)
+
 				fmt.Printf("errored for fd=%d err=%v\n", e.Fd, err)
+
 			case e.Events&(unix.EPOLLIN) != 0:
 				for {
-					buf := s.buffers.GetBuffer()
+					buf := pool.GetBuffer()
 					n, err := unix.Read(int(e.Fd), buf)
 					if err != nil {
 						if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
@@ -180,7 +196,7 @@ func (s *HTTPServer) ListenAndServe() error {
 
 					data := make([]byte, n)
 					copy(data, buf[:n])
-					s.buffers.PutBuffer(buf)
+					pool.PutBuffer(buf)
 					// remember now EPOLLOUT is one of interested events
 					if err := unix.EpollCtl(s.epollFd, unix.EPOLL_CTL_MOD, int(e.Fd), &unix.EpollEvent{
 						Events: EVENT_IN_OUT_ET_ERR,
